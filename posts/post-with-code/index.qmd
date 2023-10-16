@@ -1,0 +1,149 @@
+---
+title: "Addresses and Routes"
+author: "Greg Macfarlane"
+date: "2022-12-14"
+categories: [news, code, analysis]
+image: "image.jpg"
+---
+
+```{r}
+library(tidyverse) # everything
+library(sf) # everywhere
+library(leaflet) # all at once
+
+# geocoding through mapbox
+library(mapboxapi)
+
+# distance and routefinding through r5r
+options(java.parameters = '-Xmx8G')
+library(r5r)
+
+# traveling salesman problem through ompr
+library(ompr)
+```
+
+My girlfriend is a director at a local nonprofit. She has a task to deliver
+holiday meal packs to multiple (200+) houses who have requested one, or been
+referred by a community organization. This involves:
+
+-   Grouping addresses into route clusters
+-   Ordering the clusters so that the task can be completed in the smallest time
+    possible.
+
+## Route Clusters
+
+The first task will be to take the addresses (mailing addresses) and grouping
+them into clusters that can be assigned to individual volunteers. This requires
+putting the addresses in lat-long format. We can geocode addresses using the
+`mapboxapi` package which access the MapBox API. Note that you will need to have
+a mapbox access token.
+
+```{r}
+# addresses <- tibble(
+#   address = c(
+#     "1651 Willow Lane, Provo Utah 84604",
+#     "2197 Silverado Dr, Provo Utah 84663",
+#     "1695 W 1730 N, Provo Utah 84604",
+#     "1400 Maple Lane, Provo UT 84604",
+#     "1181 Ash Avenue, Provo UT 84604",
+#     "1234 N Main Street, Orem UT",
+#     "145 N 950 E APT B PLEASANT GROVE, UT 84062"
+#   )
+# ) %>%
+addresses <- read_csv("data/heber.csv") %>%
+  transmute(id = 1:n(), address = str_c(Address, ", ", State))
+# helper functions to get the lat / long from a list into two columns
+first <- function(x){x[[1]]}
+secnd <- function(x){x[[2]]}
+
+addresses <- addresses %>%
+  mutate(
+    latlon = map(address, mb_geocode),
+    lon = map_dbl(latlon, first),
+    lat = map_dbl(latlon, secnd),
+  ) 
+```
+
+We can use the $k$-means function to determine which group each address is in
+given a fixed number of groups.
+
+```{r}
+CLUSTERN <- 6
+kresults <- kmeans(addresses[, c("lat", "lon")], CLUSTERN)
+addresses$cluster <- kresults$cluster
+```
+
+Let's map the cluster assignments. Looks good.
+
+```{r}
+addresses_sf <- st_as_sf(addresses, coords = c("lon", "lat"), crs = 4326)
+pal <- colorNumeric("Dark2", addresses$cluster)
+
+leaflet(addresses_sf) %>%
+  addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
+  addCircleMarkers(color = ~pal(cluster))
+```
+
+## Routing
+
+The second main step here will be to solve a traveling salesman problem on each
+cluster to identify the shortest path between all points.
+
+Turns out that the Mapbox API also has a `mb_optimized_route` function that
+performs a travelling salesman solution given a set of coordinates!
+Unfortunately it only does lists of twelve coordinates.
+
+```{r}
+myrouter <- function(df){
+  if (nrow(df) <= 1) {
+    message("Cannot generate TSP solution for one point")
+  } else if (nrow(df) > 12) {
+    message("Cannot generate solution for more than 12 points") 
+  } else {
+    mb_optimized_route(df, profile = "driving-traffic")
+  }
+}
+
+addresses_sf %>%
+  group_by(cluster) %>%
+  nest()  %>%
+  mutate(
+    route = map(data, myrouter)
+  )
+  
+  
+optimized_route <- mb_optimized_route(, profile = "driving-traffic")
+
+
+leaflet() %>%
+  addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
+  addMarkers(data = optimized_route$waypoints, label = ~as.character(waypoint_index)) %>%
+  addPolylines(data = optimized_route$route, color = "red")
+```
+
+Can we write out these directions as an address?
+
+I wonder if we could build our own
+
+To do this, we need to compute a travel time matrix between each point in each
+cluster. We will use the `r5r` package to make this happen, which is an R
+interface to the `r5` routing algorithm.
+
+I downloaded the `utah-latest.osm.pbf` binary planet file from geofabrik and
+placed it in the `r5` folder. Now I need to tell `r5r` to build the network.
+
+```{r}
+r5r_core <- setup_r5(data_path = "r5/", verbose = FALSE)
+```
+
+Once this network is built, constructing a travel time matrix from it is pretty
+straightforward.
+
+```{r}
+dots <- addresses_sf %>% filter(cluster == 1)
+ttl <- travel_time_matrix(r5r_core, origins = dots, destinations = dots,
+                          mode = "CAR")
+
+# transform into actual matrix for TSP
+pivot_wider(ttm, names_from = toId)
+```
