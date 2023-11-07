@@ -1,0 +1,4 @@
+gmaps==0.9.0
+googlemaps==3.0.2
+ortools==7.3.7083
+pandas==0.25.0
